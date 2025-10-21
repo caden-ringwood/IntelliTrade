@@ -1,0 +1,62 @@
+You bet! Here is the raw content of the .gitignore file for you to copy and paste directly into your ../.gitignore file.
+
+# =======================================================
+# IntelliTrade Project Git Ignore File
+# Prevents committing temporary, local, and generated files.
+# =======================================================
+
+# 1. PYTHON ARTIFACTS
+######################
+# Bytecode files (created when Python modules are imported)
+__pycache__/
+*.pyc
+
+# Local installation folder for dependencies (Virtual Environment)
+.venv/
+venv/
+env/
+
+# Package management files
+# If you use pipenv:
+Pipfile.lock
+# If you use conda/poetry
+# poetry.lock
+
+# Python testing and documentation artifacts
+.pytest_cache/
+htmlcov/
+.nox/
+
+# 2. DATA SCIENCE AND MACHINE LEARNING OUTPUTS
+###############################################
+# This is CRITICAL. Never commit large, binary trained models or scalers.
+# They are rebuilt by the pipeline and should not bloat the repository.
+# These paths are based on your pipeline.py script's output paths:
+assets/best_model.joblib
+assets/scaler.joblib
+*.joblib
+*.pkl
+
+# Data files (raw data is often too large to commit)
+# Use this if you only commit a small sample of data
+# or get data via API (like yfinance).
+../data/*.csv
+../data/*.xlsx
+../data/*.zip
+
+# 3. OPERATING SYSTEM & IDE ARTIFACTS
+#######################################
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# JetBrains IDEs (PyCharm, IntelliJ, etc.)
+.idea/
+
+# VS Code
+.vscode/
+
+# Jupyter Notebook / VS Code output files
+.ipynb_checkpoints
