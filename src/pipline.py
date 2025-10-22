@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder # Added OneHotEncoder
-from sklearn.compose import ColumnTransformer # Added ColumnTransformer
+# REMOVED: from sklearn.model_selection import train_test_split 
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer 
 from sklearn.metrics import accuracy_score
 import joblib
 import os
@@ -14,7 +14,9 @@ from model import IntelliTradeLogReg, IntelliTradeRF, IntelliTradeGBC, \
                    IntelliTradeRFSparse, IntelliTradeRFDeep, \
                    IntelliTradeGBCFast, IntelliTradeGBCDeep, \
                    IntelliTradeKNN, IntelliTradeMLP, \
-                   IntelliTradeSVC, IntelliTradeGNB 
+                   IntelliTradeSVC, IntelliTradeSVCSmooth, IntelliTradeSVCSharp, \
+                   IntelliTradeSVCFast, IntelliTradeSVCComplex, \
+                   IntelliTradeGNB # Keep GNB import for simplicity, even if not used
 
 # --- Configuration ---
 # Your revised, verified list of 30 tickers (RR replaced with RTX - Raytheon)
@@ -31,32 +33,34 @@ TICKERS = [
 ] 
 START_DATE = '2010-01-01' 
 SCALER_OUTPUT_PATH = '../assets/scaler.joblib'
-PREPROCESSOR_OUTPUT_PATH = '../assets/preprocessor.joblib' # New path for the full preprocessor
+PREPROCESSOR_OUTPUT_PATH = '../assets/preprocessor.joblib' 
+TEMPORAL_SPLIT_DATE = '2023-01-01' # NEW: Split data at this date: Train before, Test after.
 
 # Define the candidate models to test
 ModelCandidate = namedtuple('ModelCandidate', ['name', 'instance'])
 MODEL_CANDIDATES = [
-    # 1. LINEAR BASELINE
-    ModelCandidate("LogReg (Base)", IntelliTradeLogReg(max_iter=5000)),
+    # 1. TOP PERFORMERS (The New RF Focus)
+    ModelCandidate("RF (Deep/Complex)", IntelliTradeRFDeep()), 
+    ModelCandidate("RF (Massive Est)", IntelliTradeRFMassive()), 
+    ModelCandidate("RF (Shallow Reg)", IntelliTradeRFShallow()), 
+    ModelCandidate("RF (Min Leaf 10)", IntelliTradeRFMinLeaf()), 
+
+    # 2. COMPETITIVE BENCHMARKS
+    ModelCandidate("SVC (Sharp C=10)", IntelliTradeSVCSharp()), 
+    ModelCandidate("KNN (15 Neighbors)", IntelliTradeKNN()),      
+    ModelCandidate("GBC (Base)", IntelliTradeGBC()),             
+
+    # 3. SVC TUNING VARIATIONS (To complete the tuning matrix)
+    ModelCandidate("SVC (Base C=1)", IntelliTradeSVC()),
+    ModelCandidate("SVC (Smooth C=0.1)", IntelliTradeSVCSmooth()),
+    ModelCandidate("SVC (Low Gamma 0.01)", IntelliTradeSVCFast()),
+    ModelCandidate("SVC (High Gamma 1.0)", IntelliTradeSVCComplex()),
     
-    # 2. RANDOM FOREST VARIATIONS
-    ModelCandidate("RF (Base)", IntelliTradeRF()),
-    ModelCandidate("RF (Sparse/Fast)", IntelliTradeRFSparse()), 
-    ModelCandidate("RF (Deep/Complex)", IntelliTradeRFDeep()),   
-    
-    # 3. GRADIENT BOOSTING VARIATIONS
-    ModelCandidate("GBC (Base)", IntelliTradeGBC()),
-    ModelCandidate("GBC (Fast Learn)", IntelliTradeGBCFast()),   
-    ModelCandidate("GBC (Deep/Precise)", IntelliTradeGBCDeep()), 
-    
-    # 4. OTHER MODEL TYPES
-    ModelCandidate("KNN (15 Neighbors)", IntelliTradeKNN()),
+    # 4. Neural Network (For comparison)
     ModelCandidate("MLP (Neural Net)", IntelliTradeMLP()),
-    ModelCandidate("SVC (RBF Kernel)", IntelliTradeSVC()),
-    ModelCandidate("Naive Bayes (GNB)", IntelliTradeGNB()),
 ]
 
-# --- 1. Data Ingestion & Feature Engineering ---
+# --- 1. Data Ingestion & Feature Engineering (UNCHANGED) ---
 
 def load_data(tickers=TICKERS, start=START_DATE):
     """
@@ -67,21 +71,22 @@ def load_data(tickers=TICKERS, start=START_DATE):
     
     try:
         # Download all data (returns a MultiIndex DataFrame)
-        df = yf.download(tickers, start=start, auto_adjust=True) 
+        df = yf.download(tickers, start=start) 
         print("✅ Data download successful.")
         
         # Check if the DataFrame columns are fully empty after download
         if df.empty:
             raise ValueError("Downloaded DataFrame is entirely empty.")
         
-        # --- ROBUST MULTIINDEX EXTRACTION ---
+        # --- ROBUST MULTIINDEX EXTRACTION (Extracting Close, High, Low, Volume) ---
         if isinstance(df.columns, pd.MultiIndex):
             
             # Select relevant data columns
-            valid_metrics = ['Close', 'Volume']
+            valid_metrics = ['Close', 'High', 'Low', 'Volume'] 
             df_cleaned = []
             
             for metric in valid_metrics:
+                # Check for metric existence before processing
                 if metric not in df.columns.get_level_values(0):
                     print(f"⚠️ Warning: Missing metric '{metric}' in downloaded data.")
                     continue
@@ -102,8 +107,8 @@ def load_data(tickers=TICKERS, start=START_DATE):
             return df_combined
         
         # Fallback for single ticker (unlikely but safe)
-        elif all(col in df.columns for col in ['Close', 'Volume']):
-            return df[['Close', 'Volume']]
+        elif all(col in df.columns for col in ['Close', 'High', 'Low', 'Volume']):
+            return df[['Close', 'High', 'Low', 'Volume']]
         else:
             raise ValueError("Downloaded data structure is unusable.")
 
@@ -114,31 +119,48 @@ def load_data(tickers=TICKERS, start=START_DATE):
 
 def feature_engineering(df_raw):
     """
-    Creates the target variable and multiple, more predictive feature variables 
-    across all tickers, including Volume and Day-of-Week effects.
+    Adds Lagged Price, Volume Shock, Day of Week, and Average True Range (ATR).
+    Filters tickers to ensure all necessary columns exist before processing.
     """
     print("-> Engineering Features...")
     
     all_X = []
     all_y = []
     
-    # Identify unique tickers based on column names (e.g., 'MSFT_Close')
-    ticker_cols = [col.split('_')[0] for col in df_raw.columns if col.endswith('_Close')]
+    # 1. Determine which tickers have ALL the required columns
+    required_suffixes = ['_Close', '_High', '_Low', '_Volume'] 
     
-    # Iterate over the tickers
-    for ticker_symbol in set(ticker_cols):
+    # Identify unique tickers that were downloaded successfully
+    all_downloaded_tickers = list(set([col.split('_')[0] for col in df_raw.columns if '_' in col]))
+    
+    # Filter for tickers that have ALL required columns for feature calculation
+    valid_ticker_symbols = []
+    for ticker in all_downloaded_tickers:
+        has_all_data = all(f'{ticker}{suffix}' in df_raw.columns for suffix in required_suffixes)
+        if has_all_data:
+            valid_ticker_symbols.append(ticker)
+        else:
+            # This is where EBAY likely failed. We skip it, which is the correct robust behavior.
+            print(f"⚠️ Skipping {ticker}: Missing one or more required columns ({[f'{ticker}{suffix}' for suffix in required_suffixes if f'{ticker}{suffix}' not in df_raw.columns]}).")
+            
+    print(f"Using {len(valid_ticker_symbols)}/{len(TICKERS)} tickers with complete data.")
+    
+    # 2. Iterate only over the filtered, valid tickers
+    for ticker_symbol in valid_ticker_symbols:
         
         # Create a temporary DataFrame for feature calculation
-        # Use .copy() to avoid SettingWithCopyWarning
+        # Safely extract data columns for the valid ticker
         ticker_df = pd.DataFrame({
-            'Close': df_raw[f'{ticker_symbol}_Close'],
+            'Close': df_raw[f'{ticker_symbol}_Close'], 
+            'High': df_raw[f'{ticker_symbol}_High'],
+            'Low': df_raw[f'{ticker_symbol}_Low'],
             'Volume': df_raw[f'{ticker_symbol}_Volume']
         }).copy()
         
         # --- 1. TARGET (y): Price direction prediction (1=Up, 0=Down)
         ticker_df['Target'] = (ticker_df['Close'].shift(-1) > ticker_df['Close']).astype(int)
         
-        # --- 2. CORE FEATURES (Momentum and Volatility) ---
+        # --- 2. CORE TECHNICAL FEATURES (Momentum, Volatility, Delta) ---
         
         # Feature 1: Moving Average Delta 
         ticker_df['MA_20'] = ticker_df['Close'].rolling(window=20).mean()
@@ -159,18 +181,38 @@ def feature_engineering(df_raw):
         with np.errstate(divide='ignore', invalid='ignore'):
             ticker_df['Feature_BBPct'] = (ticker_df['Close'] - lower_band) / (upper_band - lower_band)
             
-        # --- 3. NEW FEATURES (Volume and Time) ---
+        # --- 3. NEW FEATURES FOR IMPROVED PREDICTIVE POWER ---
         
         # Feature 4: Volume Shock (Z-Score of Volume)
         volume_mean = ticker_df['Volume'].rolling(window=20).mean()
         volume_std = ticker_df['Volume'].rolling(window=20).std()
         ticker_df['Feature_Volume_ZScore'] = (ticker_df['Volume'] - volume_mean) / volume_std
         
-        # Feature 5: Day of Week (Categorical Feature)
-        # 0=Monday, 4=Friday. (The model needs to see if Friday behavior is unique)
+        # Feature 5: Average True Range (ATR) - Volatility
+        # Calculate True Range: max(High-Low, abs(High-PrevClose), abs(Low-PrevClose))
+        high_low = ticker_df['High'] - ticker_df['Low']
+        # Use Close price for the previous day's close in ATR.
+        high_prev_close = np.abs(ticker_df['High'] - ticker_df['Close'].shift(1)) 
+        low_prev_close = np.abs(ticker_df['Low'] - ticker_df['Close'].shift(1))
+        true_range = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+        # ATR is the 14-day EMA of the True Range
+        ticker_df['Feature_ATR'] = true_range.ewm(span=14, adjust=False).mean()
+
+        # Feature 6 & 7: Lagged Price Change (Time Series Dependency)
+        ticker_df['Feature_Lag1_Pct'] = ticker_df['Close'].pct_change(periods=1) * 100
+        ticker_df['Feature_Lag5_Pct'] = ticker_df['Close'].pct_change(periods=5) * 100
+        
+        # Feature 8: Day of Week (Categorical Feature)
         ticker_df['Feature_DayOfWeek'] = ticker_df.index.dayofweek.astype('category')
         
         # --- CLEANUP ---
+        
+        # Identify the final list of features
+        features = [
+            'Feature_MA_Delta', 'Feature_RSI', 'Feature_BBPct', 
+            'Feature_Volume_ZScore', 'Feature_ATR', 'Feature_Lag1_Pct', 
+            'Feature_Lag5_Pct', 'Feature_DayOfWeek'
+        ]
         
         # Remove any rows with NaN values created by rolling windows/shifts (RSI/BB/MA need 14-20 days)
         ticker_df.dropna(inplace=True) 
@@ -191,14 +233,14 @@ def feature_engineering(df_raw):
     X_raw = pd.concat(all_X)
     y = pd.concat(all_y)
     
-    # Identify the final features
-    numerical_features = ['Feature_MA_Delta', 'Feature_RSI', 'Feature_BBPct', 'Feature_Volume_ZScore']
+    # Identify the final list of features again for the final DataFrame
+    numerical_features = ['Feature_MA_Delta', 'Feature_RSI', 'Feature_BBPct', 'Feature_Volume_ZScore', 'Feature_ATR', 'Feature_Lag1_Pct', 'Feature_Lag5_Pct']
     categorical_features = ['Feature_DayOfWeek']
     
     X = X_raw[numerical_features + categorical_features]
     
-    # Shuffle the combined data to mix the tickers before splitting
-    combined = pd.concat([X, y], axis=1).sample(frac=1, random_state=42).reset_index(drop=True)
+    # We remove the random shuffle here and rely on the index for temporal splitting
+    combined = pd.concat([X, y], axis=1).sort_index() 
     
     X_shuffled = combined[numerical_features + categorical_features]
     y_shuffled = combined['Target']
@@ -218,13 +260,26 @@ def train_and_compare(X, y, candidates):
         print("\n❌ Comparison aborted: Input data is empty.")
         return None
     
-    # Identify feature types for Sklearn preprocessing
-    numerical_features = ['Feature_MA_Delta', 'Feature_RSI', 'Feature_BBPct', 'Feature_Volume_ZScore']
+    # -------------------------------------------------------------------
+    # NEW: TEMPORAL SPLIT (No more random shuffle - avoids look-ahead bias)
+    # -------------------------------------------------------------------
+    split_date = pd.to_datetime(TEMPORAL_SPLIT_DATE)
+    
+    # Find the index where the date crosses the split threshold
+    # Since we sorted by index (date) in feature_engineering, this is safe
+    split_idx = X.index.get_loc(split_date, method='nearest')
+    
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    
+    print(f"\n📊 Splitting Data Temporally:")
+    print(f"   Training samples (Before {TEMPORAL_SPLIT_DATE}): {len(X_train)}")
+    print(f"   Testing samples (After {TEMPORAL_SPLIT_DATE}): {len(X_test)}")
+    
+    # --- Preprocessing (Scaler and Encoder) ---
+    numerical_features = ['Feature_MA_Delta', 'Feature_RSI', 'Feature_BBPct', 'Feature_Volume_ZScore', 'Feature_ATR', 'Feature_Lag1_Pct', 'Feature_Lag5_Pct']
     categorical_features = ['Feature_DayOfWeek']
 
-    # Create the preprocessing pipeline
-    # Numerical data is Scaled (StandardScaler)
-    # Categorical data is One-Hot Encoded (OneHotEncoder)
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', StandardScaler(), numerical_features),
@@ -233,16 +288,11 @@ def train_and_compare(X, y, candidates):
         remainder='passthrough'
     )
     
-    # Split the data once for consistent comparison
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-    
     # Fit the preprocessor only on the training data
     X_train_processed = preprocessor.fit_transform(X_train)
     X_test_processed = preprocessor.transform(X_test)
     
-    # Save the full preprocessor, not just the scaler, as it now handles encoding too!
+    # Save the full preprocessor
     save_artifacts(preprocessor, PREPROCESSOR_OUTPUT_PATH, type="Preprocessor (Scaler+Encoder)")
     
     best_accuracy = 0
@@ -250,7 +300,7 @@ def train_and_compare(X, y, candidates):
     results = {}
 
     print("\n" + "="*50)
-    print(f"STARTING MODEL COMPARISON ({len(candidates)} CANDIDATES) with new features.")
+    print(f"STARTING TEMPORAL MODEL COMPARISON ({len(candidates)} CANDIDATES)")
     print("="*50)
 
     for name, model_instance in candidates:
@@ -259,7 +309,7 @@ def train_and_compare(X, y, candidates):
         # Train on the fully processed (scaled and encoded) data
         model_instance.fit(X_train_processed, y_train)
         
-        # Evaluate
+        # Evaluate on unseen future data
         y_pred = model_instance.predict(X_test_processed)
         accuracy = accuracy_score(y_test, y_pred)
         
@@ -271,19 +321,19 @@ def train_and_compare(X, y, candidates):
             best_model = (name, model_instance)
 
     print("\n" + "="*50)
-    print("COMPARISON RESULTS:")
+    print("TEMPORAL COMPARISON RESULTS:")
     for name, acc in results.items():
         print(f" - {name}: {acc:.4f}")
         
     if best_model:
         best_name, best_instance = best_model
-        print(f"\n🏆 BEST MODEL: {best_name} with Accuracy: {best_accuracy:.4f}")
+        print(f"\n🏆 BEST MODEL: {best_name} with TEMPORAL Accuracy: {best_accuracy:.4f}")
         return best_model
     else:
         print("\nFailed to train any models.")
         return None
 
-# --- 3. Deployment/Serialization ---
+# --- 3. Deployment/Serialization (UNCHANGED) ---
 
 def save_artifacts(artifact, path, type="Model"):
     """Saves the trained model or scaler."""
